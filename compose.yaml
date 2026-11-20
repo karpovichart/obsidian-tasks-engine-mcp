@@ -1,0 +1,10 @@
+services:
+  obsidian-tasks:
+    build: .
+    environment:
+      OBSIDIAN_TASKS_HTTP_HOST: 0.0.0.0
+    ports:
+      - "3000:3000"
+    volumes:
+      - "${OBSIDIAN_VAULT_PATH:?Set OBSIDIAN_VAULT_PATH to your vault directory}:/data/obsidian:rw"
+    restart: unless-stopped
