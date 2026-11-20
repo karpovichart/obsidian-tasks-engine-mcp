@@ -126,7 +126,18 @@ if (httpPort === undefined) {
     const handler = toNodeHandler(
         createMcpHandler(() => createServer(config), { legacy: 'stateless', maxRequestBodySize: maxBodyBytes }),
     );
-    const validateHost = localhostHostValidation();
+    const validateLocalHost = localhostHostValidation();
+    const allowedHosts = new Set(
+        (process.env.OBSIDIAN_TASKS_HTTP_ALLOWED_HOSTS ?? '')
+            .split(',')
+            .map((host) => host.trim().toLowerCase())
+            .filter(Boolean),
+    );
+    const validateHost = (request: IncomingMessage, response: ServerResponse): boolean => {
+        const offered = request.headers.host?.toLowerCase();
+        if (offered && allowedHosts.has(offered)) return true;
+        return validateLocalHost(request, response);
+    };
     const validateOrigin = localhostOriginValidation();
 
     const httpServer = createHttpServer((request, response) => {
@@ -150,7 +161,9 @@ if (httpPort === undefined) {
 
     // Report the port the kernel actually assigned, not the one asked for:
     // with `--http 0` those differ, and that is how the smoke test finds us.
-    httpServer.listen(httpPort, '127.0.0.1', () => {
+    // Containers need an explicit opt-in to accept traffic forwarded from the host.
+    const httpHost = process.env.OBSIDIAN_TASKS_HTTP_HOST ?? '127.0.0.1';
+    httpServer.listen(httpPort, httpHost, () => {
         const address = httpServer.address();
         const port = typeof address === 'object' && address !== null ? address.port : httpPort;
         process.stderr.write(`MCP over Streamable HTTP on http://127.0.0.1:${port}${endpoint}\n`);

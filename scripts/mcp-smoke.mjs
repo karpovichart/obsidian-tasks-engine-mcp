@@ -120,8 +120,8 @@ async function checkTools(client, era) {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     check(
-        'the three tools are listed',
-        names.join(', ') === 'explain_query, query_tasks, tasks_query_syntax',
+        'the six tools are listed',
+        names.join(', ') === 'add_task, explain_query, query_tasks, request_sync, tasks_query_syntax, update_task',
         `got: ${names.join(', ')}`,
     );
 
@@ -133,8 +133,9 @@ async function checkTools(client, era) {
         `got: ${parameters.join(', ')}`,
     );
     check(
-        'the tools are marked read-only',
-        tools.every((t) => t.annotations?.readOnlyHint === true),
+        'query tools are read-only and task write tools are writable',
+        tools.filter((t) => !['add_task', 'update_task', 'request_sync'].includes(t.name)).every((t) => t.annotations?.readOnlyHint === true) &&
+            ['add_task', 'update_task', 'request_sync'].every((name) => tools.find((t) => t.name === name)?.annotations?.readOnlyHint === false),
     );
 
     const example = await client.callTool({

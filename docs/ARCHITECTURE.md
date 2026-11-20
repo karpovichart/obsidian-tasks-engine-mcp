@@ -261,15 +261,27 @@ as code, and the one place that does is off by default.
   by itself and is never patched locally: an update is a decision with a date
   on it, not a side effect of a build.
 
-### 4. The vault cannot be damaged
+### 4. Vault writes are narrowly bounded
 
-Read-only is the whole defence, and it is only a defence while it has no
-exceptions. Details and what it costs are under "Non-goals" below.
+`add_task` appends a task to an existing Markdown file. `update_task` changes one
+selected task's description, status, scheduled date, due date, ID or dependencies.
+Both require an existing file inside the configured vault and `-scope`; update
+requests include the line number and exact old Markdown, so stale selections are
+refused. Custom IDs are checked for uniqueness, dependencies must point to one
+existing task ID, self-links and cycles are rejected, and IDs already referenced
+by another task cannot be changed or removed. Paths are resolved through
+symlinks and checked against that boundary.
 
-One consequence to keep in mind: the CRLF normalisation in `src/vault.ts`
-happens to the string in memory. If a write path ever existed, it would write
-back LF line endings over a Windows user's file — which is the shape these
-accidents usually have.
+`request_sync` is a separate, narrow exception to vault-file writes: it accepts
+no path or content and creates only the absolute `.sync` marker path configured
+by the operator. The rclone watcher consumes that marker; the tool cannot write
+arbitrary files.
+
+`update_task` writes the edited file contents back, preserving other lines and
+line endings. It checks the file version before saving, but it is not a
+transaction with Obsidian; an external change at the same instant can still
+race the final write. Status changes use the Tasks engine's configured status,
+recurrence and on-completion behavior.
 
 ### Risks that have no fix here, only honesty
 
@@ -285,10 +297,10 @@ accidents usually have.
   be read later should be produced with it.
 - **Vault content becomes model input, and content can be instructions.** A
   note containing "ignore your previous instructions and …" arrives in the
-  assistant's context as a task description. The server cannot prevent that
-  and does not pretend to; what it can do is never act on what it read, which
-  it satisfies by having no actions — no writes, no network calls, no
-  second tool that takes a task as a command.
+  assistant's context as a task description. The model can call the task write
+  tools, so the server cannot claim it never acts on vault content. They only
+  append or update one task in a bounded destination; they cannot run commands
+  or choose a path outside the configured vault.
 
   What it can also do is say which words are whose. Everything in a response
   that came out of the vault — the task lines, the `includeDetails` JSON, the
@@ -309,9 +321,10 @@ the order the mistakes actually get made: do not widen `TaskDetails` without
 deciding it, do not serialise engine objects wholesale, do not let a path from
 a request reach the file system unchecked, do not build a report from an
 absolute path or from a line the engine rejected, do not decide an
-authorization question by which transport carried the call, do not add a write
-path, do not enable JavaScript evaluation from a request, do not add a
-`--host` flag. If a
+authorization question by which transport carried the call, keep task edits within
+`add_task` and `update_task`'s existing-file and vault-scope bounds, keep
+`request_sync` limited to its configured marker, do not enable JavaScript
+evaluation from a request, do not add a `--host` flag. If a
 new feature needs one of these, it needs this section changed first — in the
 same patch, with the reason.
 
@@ -320,23 +333,18 @@ same patch, with the reason.
 Not oversights, and not "later" — deliberate boundaries. They are listed here
 so that nobody spends an evening implementing one of them.
 
-**Nothing is ever written.** No completing a task, no adding one, no editing
-one, and nothing in `.obsidian/` either.
+**Task writes are limited and explicit.** `add_task` appends one unchecked task
+to an existing Markdown file. `update_task` changes a selected task's text,
+status, dates, ID or dependencies. It requires the exact line from the latest
+query result and refuses stale content. Both task tools stay inside the configured
+vault and `-scope` and do not create or delete notes or edit `.obsidian/`.
+`request_sync` creates only the fixed operator-configured `.sync` marker.
 
-Pointing any tool at a vault carries two distinct risks, and this decision
-addresses exactly one of them. The first is that the contents leak — that is a
-matter of who may ask and what goes out, and it is answered in "Security is a
-goal of the same rank as correctness" above. Being read-only does nothing for
-it. The second is that the vault is **damaged**: notes rewritten wrongly, a
-task mangled by a parsing edge case, an edit landing while Obsidian has the
-file open. Against that, read-only is not a mitigation but a guarantee, and
-only for as long as it has no exceptions — one write path and every later
-question about a lost note has to be investigated instead of ruled out.
-
-What that costs is real: a server that writes could complete a task from the
-chat. It would then have to answer for conflicts with a running Obsidian, for
-recurrence on completion, for `onCompletion` actions — and it would have to be
-trusted rather than merely permitted.
+Status changes use the Tasks engine's configured status and completion rules,
+including recurrence and on-completion behavior. IDs and dependencies are
+serialized by the same Tasks model as the query engine. The file is rewritten
+with its other lines and line endings preserved. There is a small race if another
+process changes the same note during the final write.
 
 **Not a general Obsidian API.** Tasks and nothing else: no Dataview, no
 backlink graph, no full-text search across notes. The one thing this project

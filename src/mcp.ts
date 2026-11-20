@@ -1,5 +1,5 @@
 /**
- * The MCP surface: the three tools and the text they return.
+ * The MCP surface: the tools and the text they return.
  *
  * This is deliberately separate from `src/server.ts`. Over HTTP the SDK calls
  * the server factory **once per request**, so nothing here may live in module
@@ -19,11 +19,15 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
 import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 
 import { explainOnly, runQuery, type QueryOutcome } from './engine';
 import { redactPaths } from './paths';
 import { quickReference } from './quick-reference';
 import type { AppliedSettings } from './settings';
+import { addTask } from './task-writer';
+import { updateTask, type EditableTaskStatus } from './task-editor';
+import { requestSync } from './sync-trigger';
 
 /** Replaced by esbuild with the version from `package.json`. */
 declare const __VERSION__: string;
@@ -40,6 +44,9 @@ declare const __VERSION__: string;
  */
 const maxRootDirs = 100;
 const maxToolInputElements = maxRootDirs + 10;
+
+const externalInstructionsPath = process.env.OBSIDIAN_TASKS_MCP_INSTRUCTIONS_FILE;
+const externalInstructions = externalInstructionsPath ? readFileSync(externalInstructionsPath, 'utf8').trim() : '';
 
 export interface ServerConfig {
     /** Vault directories from the command line. */
@@ -79,7 +86,17 @@ export function createServer(config: ServerConfig): McpServer {
                 'language is available: boolean combinations, relative dates, sorting, grouping, ' +
                 'tree view. Every response names the lines that were not understood and explains ' +
                 'what the query actually does.\n' +
-                'Query language reference: https://publish.obsidian.md/tasks/Queries/About+Queries',
+                'add_task appends a task to an existing Markdown note in the configured vault; targetFile is vault-relative, ' +
+                'and if omitted the newest-created Markdown note is used. Optional scheduledDate and dueDate use YYYY-MM-DD.\n' +
+                'Before update_task, call query_tasks with includeDetails: true. Pass the task path as file, its zero-based ' +
+                'lineNumber unchanged, and its exact markdown as expectedMarkdown. Omitted fields stay unchanged; null clears ' +
+                'scheduledDate or dueDate. Status values are todo, in_progress, on_hold, done, and cancelled; status changes ' +
+                'follow the vault Tasks settings, including recurrence and on-completion behavior.\n' +
+                'Task IDs may be random or caller-chosen; caller-chosen IDs are checked for uniqueness. Dependencies use existing task IDs, and self-links or cycles are rejected.\n' +
+                'Task tools affect existing Markdown inside the configured vault and -scope; request_sync creates only its fixed operator-configured marker.\n' +
+                'When the user asks to sync the vault, call request_sync; it creates the fixed .sync marker watched by the configured sync process.\n' +
+                'Query language reference: https://publish.obsidian.md/tasks/Queries/About+Queries' +
+                (externalInstructions ? '\n\nAdditional server instructions:\n' + externalInstructions : ''),
             maxToolInputElements,
         },
     );
@@ -144,6 +161,126 @@ export function createServer(config: ServerConfig): McpServer {
                 };
             } catch (error) {
                 return fail(`Query failed: ${message(error, roots)}`);
+            }
+        },
+    );
+
+    server.registerTool(
+        'add_task',
+        {
+            title: 'Add an Obsidian task',
+            description:
+                'Adds one unchecked Obsidian Tasks item to an existing Markdown file in the configured vault. ' +
+                'Set targetFile to a vault-relative .md path, or omit it to use the most recently created Markdown file. ' +
+                'Optional scheduledDate and dueDate use YYYY-MM-DD. Set id to a unique custom ID or generateId to true for a checked random ID. ' +
+                'The server never creates a note.',
+            inputSchema: z.object({
+                rootDir: z.string().optional().describe('Vault directory to write to. Omit when the server has one configured vault.'),
+                description: z.string().max(4000).describe('Single-line task description, without a checkbox prefix.'),
+                targetFile: z.string().max(1000).optional().describe('Existing Markdown file, relative to the vault. Omit to use the most recently created Markdown file.'),
+                scheduledDate: z.iso.date().optional().describe('Optional scheduled date in YYYY-MM-DD format.'),
+                dueDate: z.iso.date().optional().describe('Optional due date in YYYY-MM-DD format.'),
+                id: z.string().max(64).regex(/^[A-Za-z0-9_-]+$/).optional().describe('Optional custom task ID; rejected if already used in this vault.'),
+                generateId: z.boolean().optional().describe('Set true to generate a random unique task ID. Cannot be combined with id.'),
+            }).refine((args) => !(args.generateId === true && args.id !== undefined), {
+                message: 'Choose either a custom id or generateId, not both.',
+            }),
+            annotations: { readOnlyHint: false, openWorldHint: false },
+        },
+        async ({ rootDir, description, targetFile, scheduledDate, dueDate, id, generateId }) => {
+            const roots = rootDir ? [rootDir] : defaultRoots;
+            if (roots.length === 0) return fail('No vault directory given — pass `rootDir` or configure one at server start.');
+            if (roots.length > 1) return fail('More than one vault is configured. Pass `rootDir` to choose the vault to update.');
+            const refused = outsideConfiguredRoots(config, roots);
+            if (refused) return fail(refused);
+
+            try {
+                const result = addTask(roots[0], defaultScope, description, { targetFile, scheduledDate, dueDate, id, generateId });
+                return {
+                    content: [{ type: 'text' as const, text: `Added to ${result.file}:\n${result.line}` }],
+                    isError: false,
+                };
+            } catch (error) {
+                return fail(`Could not add task: ${message(error, roots)}`);
+            }
+        },
+    );
+
+    server.registerTool(
+        'request_sync',
+        {
+            title: 'Request vault synchronization',
+            description:
+                'Creates the configured .sync marker for the in-cluster rclone watcher. Use after task or vault changes when the user asks to sync. ' +
+                'The marker path is fixed by server configuration; this tool cannot create arbitrary files or choose a path.',
+            inputSchema: z.object({}),
+            annotations: { readOnlyHint: false, openWorldHint: false },
+        },
+        async () => {
+            try {
+                const created = requestSync();
+                return {
+                    content: [{ type: 'text' as const, text: created ? 'Synchronization requested.' : 'Synchronization is already queued.' }],
+                    isError: false,
+                };
+            } catch (error) {
+                return fail(`Could not request synchronization: ${message(error)}`);
+            }
+        },
+    );
+
+    server.registerTool(
+        'update_task',
+        {
+            title: 'Update an Obsidian task',
+            description:
+                'Updates one existing Obsidian Tasks item. Get path, lineNumber and markdown from query_tasks with includeDetails: true. ' +
+                'Pass markdown unchanged as expectedMarkdown so a stale line number cannot edit another task. ' +
+                'Omit fields to leave them unchanged; pass null for scheduledDate or dueDate to clear it. ' +
+                'Status changes use Obsidian Tasks recurrence and on-completion behavior. ' +
+                'Set id to a unique custom ID, generateId to true for a checked random ID, or id to null to remove it. ' +
+                'Set dependsOn to existing task IDs; [] clears dependencies. Self-links and cycles are rejected; IDs already used by dependents cannot be changed or removed.',
+            inputSchema: z.object({
+                rootDir: z.string().optional().describe('Vault directory to update. Omit when the server has one configured vault.'),
+                file: z.string().max(1000).describe('Existing task file path from query_tasks details, relative to the vault.'),
+                lineNumber: z.number().int().min(0).describe('Zero-based lineNumber from query_tasks details; pass it unchanged.'),
+                expectedMarkdown: z.string().max(10000).describe('Exact markdown field from query_tasks details for optimistic conflict checking.'),
+                description: z.string().max(4000).optional().describe('Replacement task text, without a checkbox prefix.'),
+                status: z.enum(['todo', 'in_progress', 'on_hold', 'done', 'cancelled']).optional().describe('New status, using the matching status configured in this vault.'),
+                scheduledDate: z.iso.date().nullable().optional().describe('New scheduled date; null clears it; omission leaves it unchanged.'),
+                dueDate: z.iso.date().nullable().optional().describe('New due date; null clears it; omission leaves it unchanged.'),
+                id: z.string().max(64).regex(/^[A-Za-z0-9_-]+$/).nullable().optional().describe('Set a unique custom ID, or null to remove the task ID.'),
+                generateId: z.boolean().optional().describe('Set true to generate a random unique task ID. Cannot be combined with id.'),
+                dependsOn: z.array(z.string().max(64).regex(/^[A-Za-z0-9_-]+$/)).max(100).optional().describe('Replace dependencies with existing task IDs; [] clears dependencies.'),
+            }).refine((args) =>
+                (args.description !== undefined || args.status !== undefined || args.scheduledDate !== undefined || args.dueDate !== undefined || args.id !== undefined || args.generateId === true || args.dependsOn !== undefined) &&
+                !(args.generateId === true && args.id !== undefined),
+            { message: 'Provide at least one update; choose either a custom id or generateId, not both.' }),
+            annotations: { readOnlyHint: false, openWorldHint: false },
+        },
+        async ({ rootDir, file, lineNumber, expectedMarkdown, description, status, scheduledDate, dueDate, id, generateId, dependsOn }) => {
+            const roots = rootDir ? [rootDir] : defaultRoots;
+            if (roots.length === 0) return fail('No vault directory given — pass `rootDir` or configure one at server start.');
+            if (roots.length > 1) return fail('More than one vault is configured. Pass `rootDir` to choose the vault to update.');
+            const refused = outsideConfiguredRoots(config, roots);
+            if (refused) return fail(refused);
+
+            try {
+                const result = await updateTask(roots[0], defaultScope, {
+                    file, lineNumber, expectedMarkdown, description, status: status as EditableTaskStatus | undefined,
+                    scheduledDate, dueDate, id, generateId, dependsOn,
+                });
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: result.newLines.length === 0
+                            ? `Updated ${result.file}:${lineNumber + 1}; the task was removed by its on-completion setting.`
+                            : `Updated ${result.file}:${lineNumber + 1}:\n${result.newLines.join('\n')}`,
+                    }],
+                    isError: false,
+                };
+            } catch (error) {
+                return fail(`Could not update task: ${message(error, roots)}`);
             }
         },
     );
@@ -218,7 +355,7 @@ function describeRootDirs(config: ServerConfig): string {
         `start: ${config.roots.join(', ') || '(none)'}`;
     if (config.scope) {
         text +=
-            `. This server only reads '${config.scope}' inside them; ` +
+            `. This server reads and writes only inside '${config.scope}' in them; ` +
             'directories outside are rejected.';
     } else if (config.pinRoots) {
         text += '. This server is pinned to those directories; others are rejected.';

@@ -39,12 +39,14 @@ another task" is one obvious example; equally possible are "which tasks under
 Projects/ have no due date at all", "group everything open by file and sort
 by urgency", "what did I finish last week", "what is scheduled for this month
 and tagged #work". Anything that would work in a `tasks` code block inside
-Obsidian works here.
+Obsidian works here. The `add_task` tool can also append one task to an
+existing Markdown note, and `update_task` can change a selected task's text, status, dates, ID or dependencies.
 
 **Obsidian itself need not be running** — nor even be installed. The server
 reads the Markdown files directly, so the vault can be queried with the app
-closed, on a headless server, over SSH, or from a script. And it only reads:
-nothing is ever written back.
+closed, on a headless server, over SSH, or from a script. Queries are read-only;
+`add_task` appends one checkbox line to an existing Markdown file inside the
+configured vault and scope.
 
 Every other Obsidian Tasks MCP server we are aware of reimplements that query
 language in code of its own, and so supports only part of it — usually
@@ -62,6 +64,18 @@ contribute, start at **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 > to an exact commit — `git submodule status` names it — and that pin is what
 > the test suite runs against. The version here is checked by `npm test`, so
 > it cannot quietly fall behind the submodule.
+
+## Container image
+
+The workflow in `.github/workflows/images.yml` builds the Dockerfile for
+linux/amd64 and linux/arm64. It derives the GHCR image path from the GitHub
+Actions context `github.repository`, so this repository publishes to
+`ghcr.io/<owner>/<repository>` without a hard-coded owner or image name.
+
+Pull requests build without publishing. Pushes to `main` publish branch and
+short-SHA tags; `v*` tags also publish version tags and `latest`. A manual
+run from Actions publishes the `edge` tag. Publishing uses the workflow's
+`GITHUB_TOKEN` with packages:write permission.
 
 ## An example
 
@@ -137,12 +151,13 @@ would in a `tasks` block inside Obsidian.
 - **Reads the vault the way Obsidian does:** the plugin's `FileParser`, your
   global filter, global query and custom statuses, frontmatter as real YAML —
   checked against real Obsidian data from the submodule.
-- **Read-only and bounded.** Nothing is written; nothing outside the configured
-  vault is read; `-scope` restricts the server to part of it.
+- **Bounded access.** Queries only read; `add_task` and `update_task` write task
+  data only inside existing notes in the configured vault and `-scope`. `request_sync`
+  can create only the operator-configured `.sync` marker.
 - **Two transports:** stdio, or Streamable HTTP on loopback with an optional
   shared secret.
-- **Three tools:** `query_tasks`, `explain_query` and `tasks_query_syntax`,
-  with the same names and parameters as the Go server it replaces.
+- **Six tools:** `query_tasks`, `explain_query`, `tasks_query_syntax`,
+  `add_task`, `update_task` and `request_sync`. The first three keep the names and parameters of the Go server it replaces.
 - **A CLI** for running queries and for `--check`, which verifies invariants on
   any vault of your own, with `--summary` for output that must not quote tasks.
 
@@ -151,8 +166,9 @@ would in a `tasks` block inside Obsidian.
 Boundaries, not omissions — the reasoning is in
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** under "Non-goals":
 
-- **It never writes.** No completing or adding tasks, nothing in `.obsidian/`.
-  Your vault is only ever read, so nothing here can damage it.
+- **Task writes are bounded.** `add_task` appends a task; `update_task` changes
+  one selected task, including its ID and dependencies. Both stay inside the
+  configured vault and scope. `request_sync` only creates the configured sync marker.
 - **Tasks only** — not a general Obsidian API: no Dataview, no backlinks, no
   full-text search across notes.
 - **It does not invent queries.** The assistant writes the query; the server
@@ -164,16 +180,16 @@ Boundaries, not omissions — the reasoning is in
 - **It does not talk to Obsidian.** The vault on disk is the whole interface.
 
 Those boundaries are mostly there for one reason: a vault is private. Medical
-appointments, salaries, other people's names. So the server reads only below
-the roots it was given — a symbolic link pointing out of the vault is skipped,
+appointments, salaries, other people's names. The server reads and task-edits only
+below the roots it was given; request_sync creates only its fixed configured marker. A symbolic link pointing out of the vault is skipped,
 not followed, and a call may not name a directory outside them unless a person
 allowed that at the command line. It returns tasks and nothing else from the
 files it reads, says its problems in the vault's own terms rather than in
 absolute paths, marks everything that came out of the vault as read data
 rather than as instructions, never evaluates JavaScript from a query unless a
-human turns it on at the command line, and never writes. `-scope` narrows it
-to part of a vault, `--summary` keeps task text out of anything that gets
-logged. The full risk model — what
+human turns it on at the command line. Task edits stay inside the configured
+vault and scope; `request_sync` creates only its fixed, operator-configured
+marker path. `--summary` keeps task text out of anything that gets logged. The full risk model — what
 could go wrong and which code prevents it — is in
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** under "Security is a goal of
 the same rank as correctness". Found a way around it? Please report it
@@ -217,20 +233,33 @@ configuration, not of installing anything further.
 
 ### As an MCP server
 
-It offers three tools:
+It offers six tools:
 
 | Tool | Parameters | Purpose |
 |---|---|---|
 | `query_tasks` | `rootDirs?`, `filters`, `includeDetails?` | Run a query |
 | `explain_query` | `rootDirs?`, `filters` | Only check and explain a query, without reading the vault |
 | `tasks_query_syntax` | — | Look up every available instruction, generated from the submodule's documentation |
+| `add_task` | `rootDir?`, `description`, `targetFile?`, `scheduledDate?`, `dueDate?`, `id?`, `generateId?` | Append a task to an existing note; optionally assign a unique custom or random ID |
+| `request_sync` | — | Queue a vault sync by creating a fixed marker configured by the server |
+| `update_task` | `rootDir?`, `file`, `lineNumber`, `expectedMarkdown`, `description?`, `status?`, `scheduledDate?`, `dueDate?`, `id?`, `generateId?`, `dependsOn?` | Update one task; assign a unique ID and set dependencies by ID |
 
-Every response contains the explanation of the query and the vault settings in
-force. A line that was not understood leads to an error response — **never** to
-a silently reduced result.
+For an update, first query with `includeDetails: true`. Pass the task's `path`,
+`lineNumber` and exact `markdown` as `file`, `lineNumber` and
+`expectedMarkdown`; `lineNumber` is zero-based, so pass it unchanged. Pass a
+new status, description, date, ID or dependency list to change it. Both
+`add_task` and `update_task` accept a custom `id` or `generateId: true` for a
+random unique ID (choose one). Use `null` to clear a date or ID, and `dependsOn: []`
+to clear dependencies. Custom IDs are checked for uniqueness; dependencies must
+refer to existing IDs and cannot create cycles. A status change follows the Tasks
+plugin's recurrence and on-completion behavior.
+
+Every query response contains the explanation and the vault settings in force.
+A line that was not understood leads to an error response — **never** to a
+silently reduced result.
 
 There are **two ways to run it**, and they differ only in how the client
-reaches the server — the same three tools, the same answers, the same vault:
+reaches the server — the same six tools and the same vault:
 
 | | stdio (default) | HTTP (`--http`) |
 |---|---|---|
@@ -532,11 +561,13 @@ src/metadata.ts        Markdown → Obsidian's CachedMetadata   ← the heart
 src/settings.ts        adopt the vault settings
 src/paths.ts           how a path is compared, and how a problem is said
 src/vault.ts           read the vault → Task[], via the plugin's FileParser
+src/task-writer.ts     append one task inside the configured vault scope
+src/task-editor.ts     update one selected task using the Tasks engine
 src/engine.ts          build, run and shape the query
 src/invariants.ts      checks that hold for every vault (--check)
 src/cli.ts             test tool without the MCP layer
 src/server.ts          MCP server: entry point, stdio and HTTP transport
-src/mcp.ts             the three tools and the text they return
+src/mcp.ts             the MCP tools and the text they return
 src/quick-reference.ts query language quick reference from vendor/…/docs
 vendor/obsidian-tasks  submodule, unmodified
 ```

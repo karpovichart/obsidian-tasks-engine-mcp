@@ -106,6 +106,14 @@ const noQueryFile = new TasksFile('');
  */
 const engineLock = new Mutex();
 
+/** Serialize operations that read or mutate the Tasks plugin's process-wide settings. */
+export function withEngineLock<T>(action: () => Promise<T> | T): Promise<T> {
+    return engineLock.runExclusive(async () => {
+        await bootstrap();
+        return action();
+    });
+}
+
 /**
  * Checks a query without reading the vault.
  *
